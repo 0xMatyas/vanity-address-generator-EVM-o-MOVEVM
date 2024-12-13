@@ -4,4 +4,4 @@ verified_addresses.txt
 # Python specific
 __pycache__/
 *.py[cod]
-*$py.class 
+*$py.class verified_addresses.txt

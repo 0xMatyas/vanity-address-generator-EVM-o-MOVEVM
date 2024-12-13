@@ -80,7 +80,7 @@ def validate_prefix(prefix):
     
     return prefix, None, True  # Always return True for case_sensitive
 
-def worker(prefix, chain_type, batch_size=1000, case_sensitive=False):
+def worker(prefix, chain_type, postfix=None, batch_size=1000, case_sensitive=False):
     """Worker function to generate and check addresses in batches"""
     for _ in range(batch_size):
         private_key_bytes = os.urandom(32)
@@ -88,38 +88,51 @@ def worker(prefix, chain_type, batch_size=1000, case_sensitive=False):
             private_key = keys.PrivateKey(private_key_bytes)
             public_key = private_key.public_key
             address = to_checksum_address(public_key.to_address())
-            # For case-sensitive search, compare exact strings
-            # For case-insensitive, compare lowercase
-            if case_sensitive:
-                if address.startswith(prefix):
-                    return address, private_key
-            else:
-                if address.lower().startswith(prefix.lower()):
-                    return address, private_key
+            
+            # Check both prefix and postfix if specified
+            matches_prefix = (address.startswith(prefix) if case_sensitive 
+                            else address.lower().startswith(prefix.lower()))
+            matches_postfix = True
+            if postfix:
+                matches_postfix = (address.endswith(postfix) if case_sensitive 
+                                 else address.lower().endswith(postfix.lower()))
+                
+            if matches_prefix and matches_postfix:
+                return address, private_key
         else:  # move
             address = generate_move_address(private_key_bytes)
             private_key = keys.PrivateKey(private_key_bytes)
-            if address.lower().startswith(prefix.lower()):
+            if (address.lower().startswith(prefix.lower()) and 
+                (not postfix or address.lower().endswith(postfix.lower()))):
                 return address, private_key
     return None
 
-def calculate_estimated_time(prefix, rate, case_sensitive=False):
-    """Calculate estimated time based on prefix length and current rate"""
+def calculate_estimated_time(prefix, rate, postfix=None, case_sensitive=False):
+    """Calculate estimated time based on prefix/postfix length and current rate"""
     if not prefix.startswith('0x'):
         prefix = '0x' + prefix
     
-    # Calculate probability: 1/(16^n) where n is the length of the prefix after 0x
-    prefix_length = len(prefix[2:])
+    # Calculate total search space based on both prefix and postfix
+    prefix_length = len(prefix[2:]) if prefix != "0x" else 0
+    postfix_length = len(postfix) if postfix else 0
+    total_pattern_length = prefix_length + postfix_length
     
-    # For case-sensitive search, we need to match exact case for letters
-    # This means for each letter position, we have 2 possibilities (upper/lower)
-    # Numbers and '0x' prefix don't affect case sensitivity
+    # Base probability calculation
+    # For n characters, probability is 1/(16^n)
+    attempts_needed = 16 ** total_pattern_length
+    
+    # For case-sensitive search in EVM addresses
     if case_sensitive:
-        letter_count = sum(1 for c in prefix[2:] if c.lower() in 'abcdef')
+        letter_count = 0
+        if prefix != "0x":
+            letter_count += sum(1 for c in prefix[2:] if c.lower() in 'abcdef')
+        if postfix:
+            letter_count += sum(1 for c in postfix if c.lower() in 'abcdef')
         # Multiply by 2^letter_count for case combinations
-        attempts_needed = (16 ** prefix_length) * (2 ** letter_count) / 2
-    else:
-        attempts_needed = (16 ** prefix_length) / 2  # Divide by 2 for average case
+        attempts_needed *= (2 ** letter_count)
+    
+    # Divide by 2 for average case
+    attempts_needed /= 2
     
     # Calculate estimated seconds
     estimated_seconds = attempts_needed / rate if rate > 0 else float('inf')
@@ -131,11 +144,27 @@ def calculate_estimated_time(prefix, rate, case_sensitive=False):
         return f"{estimated_seconds/60:.1f} minutes"
     elif estimated_seconds < 86400:
         return f"{estimated_seconds/3600:.1f} hours"
-    else:
+    elif estimated_seconds < 31536000:  # Less than a year
         return f"{estimated_seconds/86400:.1f} days"
+    else:
+        return f"{estimated_seconds/31536000:.1f} years"
 
-def generate_vanity_address(prefix="0xF", max_attempts=100000000, chain_type="evm", case_sensitive=False):
-    """Generate an address with the desired prefix using multiple processes."""
+def format_elapsed_time(seconds):
+    """Format elapsed time into appropriate units"""
+    if seconds < 60:
+        return f"{seconds:.2f} seconds"
+    elif seconds < 3600:
+        minutes = seconds / 60
+        return f"{minutes:.2f} minutes"
+    elif seconds < 86400:
+        hours = seconds / 3600
+        return f"{hours:.2f} hours"
+    else:
+        days = seconds / 86400
+        return f"{days:.2f} days"
+
+def generate_vanity_address(prefix="0xF", max_attempts=100000000, chain_type="evm", case_sensitive=False, postfix=None):
+    """Generate an address with the desired prefix and optional postfix using multiple processes."""
     # Print initial setup information
     print(f"Starting vanity address generation for {chain_type.upper()}...")
     print(f"Using {mp.cpu_count()} CPU cores")
@@ -161,7 +190,7 @@ def generate_vanity_address(prefix="0xF", max_attempts=100000000, chain_type="ev
         while attempts < max_attempts:
             # Submit worker tasks to executor
             futures = [
-                executor.submit(worker, prefix, chain_type, batch_size, case_sensitive)
+                executor.submit(worker, prefix, chain_type, postfix, batch_size, case_sensitive)
                 for _ in range(num_workers)
             ]
             
@@ -180,13 +209,14 @@ def generate_vanity_address(prefix="0xF", max_attempts=100000000, chain_type="ev
                 current_time = time.time()
                 if current_time - last_update >= 0.01:
                     rate = attempts / (current_time - start_time)
+                    elapsed = current_time - start_time
                     
                     # Update estimated time every 2 seconds
                     if current_time - last_estimate >= 2:
-                        est_time = calculate_estimated_time(prefix, rate, case_sensitive)
+                        est_time = calculate_estimated_time(prefix, rate, postfix, case_sensitive)
                         last_estimate = current_time
                     
-                    print(f"\rAttempts: {attempts:,} | Rate: {rate:.2f} addr/sec | Time: {current_time - start_time:.1f}s | Est: {est_time}", end='\r')
+                    print(f"\rAttempts: {attempts:,} | Rate: {rate:.2f} addr/sec | Time: {format_elapsed_time(elapsed)} | Est: {est_time}", end='\r')
                     last_update = current_time
 
     print("\nMax attempts reached. No match found.")
@@ -207,35 +237,73 @@ if __name__ == "__main__":
         print("- Move addresses are always lowercase")
         print("- Example: 0x1234abcd...")
     
+    # Ask for search type first
     while True:
-        desired_prefix = input("\nEnter desired prefix (e.g., FACE or 0xFACE): ")
-        formatted_prefix, error, _ = validate_prefix(desired_prefix)
+        print("\nWhat would you like to search for?")
+        print("1. Prefix (starting characters)")
+        print("2. Postfix (ending characters)")
+        print("3. Both prefix and postfix")
+        search_type = input("Enter your choice (1/2/3): ").strip()
         
-        if error:
-            print(f"\nError: {error}")
-            print("Please try again with valid hexadecimal characters.")
-            continue
+        if search_type in ['1', '2', '3']:
+            break
+        print("Invalid choice. Please enter 1, 2, or 3")
+
+    formatted_prefix = None
+    formatted_postfix = None
+    
+    # Handle prefix input if needed
+    if search_type in ['1', '3']:
+        while True:
+            desired_prefix = input("\nEnter desired prefix (e.g., FACE or 0xFACE): ")
+            formatted_prefix, error, _ = validate_prefix(desired_prefix)
             
+            if error:
+                print(f"\nError: {error}")
+                print("Please try again with valid hexadecimal characters.")
+                continue
+            break
+    
+    # Handle postfix input if needed
+    if search_type in ['2', '3']:
+        while True:
+            desired_postfix = input("\nEnter desired ending characters (e.g., DEAD): ")
+            if desired_postfix.startswith('0x'):
+                desired_postfix = desired_postfix[2:]
+            formatted_postfix, error, _ = validate_prefix('0x' + desired_postfix)
+            if error:
+                print(f"\nError: {error}")
+                print("Please try again with valid hexadecimal characters.")
+                continue
+            formatted_postfix = formatted_postfix[2:]  # Remove '0x' from postfix
+            break
+    
+    # Only ask for case sensitivity on EVM addresses
+    case_sensitive = False
+    if chain_type == "evm":
         while True:
             case_sensitive_input = input("Enable case-sensitive search? (yes/no): ").lower()
             if case_sensitive_input in ['yes', 'no']:
                 case_sensitive = case_sensitive_input == 'yes'
                 break
             print("Please answer 'yes' or 'no'")
-        
-        # If we get here, the prefix is valid
-        print(f"\nSearching with prefix: {formatted_prefix}")
-        if chain_type == "evm":
-            if case_sensitive:
-                print("Case-sensitive search enabled (looking for exact match including uppercase/lowercase)")
-            else:
-                print("Case-insensitive search (all lowercase)")
-        break
+    
+    # Display search criteria
+    print("\nSearch criteria:")
+    if formatted_prefix:
+        print(f"- Starting with: {formatted_prefix}")
+    if formatted_postfix:
+        print(f"- Ending with: {formatted_postfix}")
+    if chain_type == "evm" and case_sensitive:
+        print("- Case-sensitive search enabled")
+    else:
+        print("- Case-insensitive search")
 
     address, private_key = generate_vanity_address(
-        prefix=formatted_prefix, 
+        prefix=formatted_prefix or "0x", 
         chain_type=chain_type,
         case_sensitive=case_sensitive,
+        postfix=formatted_postfix,
         max_attempts=100000000
     )
 
